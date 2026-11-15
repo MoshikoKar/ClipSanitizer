@@ -221,15 +221,19 @@ fn release_to_update(rel: &GhRelease, installed: bool) -> Result<AvailableUpdate
 }
 
 fn curl_get(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
+    // No -f: capture body + trailing HTTP status so private-repo 404s are not
+    // misreported as a missing release when the caller is simply unauthenticated.
     let mut cmd = Command::new("curl.exe");
     cmd.args([
-        "-fsSL",
+        "-sSL",
         "--max-time",
         &timeout_secs.to_string(),
         "-A",
         &format!("{APP_NAME}-updater/{}", env!("CARGO_PKG_VERSION")),
         "-H",
         "Accept: application/vnd.github+json",
+        "-w",
+        "\n%{http_code}",
         url,
     ])
     .stdin(Stdio::null())
@@ -241,15 +245,32 @@ fn curl_get(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let code = out.status.code().unwrap_or(-1);
-        if code == 22 || err.contains("404") {
-            return Err("Update check failed: release not found (HTTP error)".into());
-        }
-        if err.contains("429") || err.to_ascii_lowercase().contains("rate limit") {
-            return Err("Update check rate-limited by GitHub; try again later".into());
-        }
         return Err(format!("Update check failed (curl exit {code}): {}", err.trim()));
     }
-    Ok(out.stdout)
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let (body, status) = split_curl_http_status(&raw)
+        .ok_or_else(|| "Update check failed: could not read HTTP status from curl".to_string())?;
+    match status {
+        200 => Ok(body.as_bytes().to_vec()),
+        403 | 429 => Err(
+            "Update check rate-limited or forbidden by GitHub; try again later".into(),
+        ),
+        404 => Err(format!(
+            "Cannot read GitHub Releases for {REPO}.\n\n\
+             The repository is private or has no public releases, so the updater \
+             cannot check without a token (tokens are never embedded in the app).\n\n\
+             Make the repository public, then try again."
+        )),
+        other => Err(format!("Update check failed (HTTP {other}).")),
+    }
+}
+
+/// Split `curl -w "\\n%{{http_code}}"` output into body and status code.
+fn split_curl_http_status(raw: &str) -> Option<(String, u16)> {
+    let raw = raw.trim_end_matches(['\r', '\n']);
+    let (body, code_str) = raw.rsplit_once('\n')?;
+    let status: u16 = code_str.trim().parse().ok()?;
+    Some((body.to_string(), status))
 }
 
 fn curl_download(url: &str, dest: &Path) -> Result<(), String> {
@@ -698,5 +719,15 @@ aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899  ClipSanitizer-
         assert!(!is_sha256_hex(
             "ggbbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         ));
+    }
+
+    #[test]
+    fn split_curl_http_status_reads_trailing_code() {
+        let (body, code) = split_curl_http_status("{\"ok\":true}\n200").unwrap();
+        assert_eq!(body, "{\"ok\":true}");
+        assert_eq!(code, 200);
+        let (body404, code404) = split_curl_http_status("{\"message\":\"Not Found\"}\n404\n").unwrap();
+        assert!(body404.contains("Not Found"));
+        assert_eq!(code404, 404);
     }
 }

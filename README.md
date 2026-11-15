@@ -100,10 +100,12 @@ cargo run
   these off in *Settings → System → Clipboard* when sanitizing real secrets.
 - Hashes use HMAC-SHA256 with a new random key per hotkey press.
 - Settings live in `%APPDATA%\app.clipsanitizer\settings.json`.
-- Updates download only from this repo's GitHub Releases. Before install or
-  portable swap, the app checks `SHA256SUMS.txt` against the downloaded file.
-  Until binaries are Authenticode-signed, Windows SmartScreen may warn on first
-  run; compare the published SHA-256 before trusting a download.
+- Updates download only from this repo's GitHub Releases. The repository must be
+  **public** (unauthenticated API); the app never embeds a GitHub token. Before
+  install or portable swap, the app checks `SHA256SUMS.txt` against the
+  downloaded file. Until binaries are Authenticode-signed, Windows SmartScreen
+  may warn on first run; compare the published SHA-256 before trusting a
+  download.
 - Troubleshooting: set `CLIP_SANITIZER_DEBUG=1` before start to log hotkey timing
   to `%APPDATA%\app.clipsanitizer\debug.log` (clipboard contents are never logged).
 - Admin windows: a normal app cannot send Ctrl+C to elevated programs. Copy first,
