@@ -54,6 +54,7 @@ then run `cargo tauri build` in `src-tauri`.
 | Press **Ctrl+Alt+C** with nothing selected | Text already on the clipboard is sanitized instead. |
 | Tray → **Sanitize clipboard now** | Same as the hotkey, without pressing it. |
 | Tray → **Pause hotkey** | Temporarily disables the global hotkey. |
+| Tray → **Check for updates (vX.Y.Z)** | Checks GitHub Releases; asks before download; verifies `SHA256SUMS.txt`. |
 | Click the tray icon (or **Open Clip Sanitizer**) | Opens the window: paste or type text, press **Sanitize** (Ctrl+Enter), review the highlighted result, **Copy**. |
 
 The window also lets you switch individual patterns on or off. **Settings** covers:
@@ -63,6 +64,7 @@ The window also lets you switch individual patterns on or off. **Settings** cove
 - notifications on or off
 - start with Windows
 - which patterns file to use
+- check for updates on/off and update channel (`stable` or `beta`)
 
 Closing the window keeps the app running in the tray. Use **Quit** from the tray
 menu to exit.
@@ -98,6 +100,10 @@ cargo run
   these off in *Settings → System → Clipboard* when sanitizing real secrets.
 - Hashes use HMAC-SHA256 with a new random key per hotkey press.
 - Settings live in `%APPDATA%\app.clipsanitizer\settings.json`.
+- Updates download only from this repo's GitHub Releases. Before install or
+  portable swap, the app checks `SHA256SUMS.txt` against the downloaded file.
+  Until binaries are Authenticode-signed, Windows SmartScreen may warn on first
+  run; compare the published SHA-256 before trusting a download.
 - Troubleshooting: set `CLIP_SANITIZER_DEBUG=1` before start to log hotkey timing
   to `%APPDATA%\app.clipsanitizer\debug.log` (clipboard contents are never logged).
 - Admin windows: a normal app cannot send Ctrl+C to elevated programs. Copy first,
@@ -109,6 +115,8 @@ cargo run
 - System tray with pause, sanitize-now, and settings entry points
 - In-app sanitize window with pattern toggles and highlighted output
 - Shared Log Sanitizer pattern / config format
+- Verified GitHub Releases updates (`ClipSanitizer-Setup.exe`,
+  `ClipSanitizer-portable.zip`, `SHA256SUMS.txt`)
 - Portable release exe; optional NSIS installer via Tauri
 
 ## Tech Stack
@@ -124,10 +132,12 @@ cargo run
 ui/                    window + notification (HTML/CSS/JS, no build step)
 src-tauri/
   src/engine.rs        sanitizing engine + tests (port of log_sanitizer.py)
+  src/update.rs        GitHub Releases check / verify / install
   src/win.rs           Win32 helpers (keys, clipboard, notification)
   src/main.rs          tray, hotkey flow, settings, UI commands
   tauri.conf.json      windows and bundle settings
   icons/               app / tray icons
+build.ps1              packages Setup, portable zip, and SHA256SUMS.txt
 ```
 
 ## License

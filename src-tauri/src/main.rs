@@ -2,9 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod update;
 mod win;
 
 use engine::{Engine, PatternInfo, SanitizeResult};
+use update::{UpdateChannel, auto_check_delay, current_version, run_auto_check, run_manual_check};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,11 +33,26 @@ struct Settings {
     patterns_file: String,
     /// Patterns switched off in the UI.
     disabled: Vec<String>,
+    /// Automatic GitHub Releases update checks (manual tray check always works).
+    check_updates: bool,
+    /// `stable` (releases/latest) or `beta` (newest non-draft, including prereleases).
+    update_channel: String,
+    /// Last update version the user dismissed (skip auto-prompt until a different version).
+    dismissed_update_version: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { hotkey: "Ctrl+Alt+C".into(), paste_after: false, show_toast: true, patterns_file: String::new(), disabled: vec![] }
+        Self {
+            hotkey: "Ctrl+Alt+C".into(),
+            paste_after: false,
+            show_toast: true,
+            patterns_file: String::new(),
+            disabled: vec![],
+            check_updates: true,
+            update_channel: "stable".into(),
+            dismissed_update_version: String::new(),
+        }
     }
 }
 
@@ -283,6 +300,13 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         &autostart,
         &MenuItem::with_id(app, "patterns", "Edit patterns file…", true, None::<&str>)?,
         &MenuItem::with_id(app, "reload", "Reload patterns", true, None::<&str>)?,
+        &MenuItem::with_id(
+            app,
+            "check_updates",
+            format!("Check for updates (v{})", current_version().display()),
+            true,
+            None::<&str>,
+        )?,
         &PredefinedMenuItem::separator(app)?,
         &MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?,
     ])?;
@@ -319,6 +343,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = app.emit_to("main", "state-changed", ());
                 }
             }
+            "check_updates" => {
+                let app = app.clone();
+                std::thread::spawn(move || run_update_check(&app, true));
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -342,6 +370,8 @@ struct StateView {
     patterns_path: String,
     autostart: bool,
     paused: bool,
+    check_updates: bool,
+    update_channel: String,
     load_message: String,
     patterns: Vec<PatternInfo>,
 }
@@ -356,6 +386,8 @@ fn view(app: &AppHandle, state: &State<AppState>) -> StateView {
         patterns_file: s.patterns_file,
         autostart: app.autolaunch().is_enabled().unwrap_or(false),
         paused: state.paused.load(Ordering::SeqCst),
+        check_updates: s.check_updates,
+        update_channel: s.update_channel,
         load_message: state.load_message.lock().unwrap().clone(),
         patterns: state.engine.lock().unwrap().patterns(),
     }
@@ -399,6 +431,8 @@ struct SettingsInput {
     show_toast: bool,
     patterns_file: String,
     autostart: bool,
+    check_updates: bool,
+    update_channel: String,
 }
 
 #[tauri::command]
@@ -415,6 +449,11 @@ fn save_settings(input: SettingsInput, app: AppHandle, state: State<AppState>) -
     new.paste_after = input.paste_after;
     new.show_toast = input.show_toast;
     new.patterns_file = input.patterns_file.trim().to_string();
+    new.check_updates = input.check_updates;
+    new.update_channel = match input.update_channel.trim().to_ascii_lowercase().as_str() {
+        "beta" => "beta".into(),
+        _ => "stable".into(),
+    };
     save_settings_file(&app, &new)?;
     let reload = new.patterns_file != old.patterns_file;
     *state.settings.lock().unwrap() = new.clone();
@@ -431,6 +470,34 @@ fn save_settings(input: SettingsInput, app: AppHandle, state: State<AppState>) -
         let _ = tray.set_tooltip(Some(format!("Clip Sanitizer - select text and press {}", new.hotkey)));
     }
     Ok(view(&app, &state))
+}
+
+fn run_update_check(app: &AppHandle, manual: bool) {
+    let state = app.state::<AppState>();
+    let (channel, dismissed, enabled) = {
+        let s = state.settings.lock().unwrap();
+        (
+            UpdateChannel::parse(&s.update_channel),
+            s.dismissed_update_version.clone(),
+            s.check_updates,
+        )
+    };
+    if !manual && !enabled {
+        return;
+    }
+    let outcome = if manual {
+        run_manual_check(channel)
+    } else {
+        run_auto_check(channel, &dismissed)
+    };
+    if let Some(ver) = outcome.dismissed_version {
+        let mut s = state.settings.lock().unwrap();
+        s.dismissed_update_version = ver;
+        let _ = save_settings_file(app, &s);
+    }
+    if outcome.should_exit {
+        app.exit(0);
+    }
 }
 
 #[tauri::command]
@@ -495,6 +562,13 @@ fn main() {
             }
             if !std::env::args().any(|a| a == "--background") && cfg!(debug_assertions) {
                 show_main(&handle);
+            }
+            {
+                let app = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(auto_check_delay());
+                    run_update_check(&app, false);
+                });
             }
             Ok(())
         })

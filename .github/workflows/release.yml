@@ -10,10 +10,20 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build release assets
+        shell: pwsh
+        run: .\build.ps1
 
       - name: Extract changelog notes
         shell: bash
@@ -31,6 +41,20 @@ jobs:
             echo "No CHANGELOG.md section found for ${VERSION}" >&2
             exit 1
           fi
+          {
+            echo ""
+            echo "### Downloads"
+            echo ""
+            echo "- \`ClipSanitizer-Setup.exe\` - per-user installer"
+            echo "- \`ClipSanitizer-portable.zip\` - portable exe + \`portable.txt\`"
+            echo "- \`SHA256SUMS.txt\` - SHA-256 checksums (required by the in-app updater)"
+            echo ""
+            echo "### SHA-256"
+            echo ""
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$NOTES_FILE"
           echo "NOTES_FILE=$NOTES_FILE" >> "$GITHUB_ENV"
 
       - name: Create GitHub Release
@@ -40,5 +64,9 @@ jobs:
           name: ClipSanitizer ${{ github.ref_name }}
           body_path: ${{ env.NOTES_FILE }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/ClipSanitizer-Setup.exe
+            dist/ClipSanitizer-portable.zip
+            dist/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -17,6 +17,8 @@ function renderState(s) {
   $("paste-after").checked = s.paste_after;
   $("show-toast").checked = s.show_toast;
   $("autostart").checked = s.autostart;
+  $("check-updates").checked = s.check_updates;
+  $("update-channel").value = s.update_channel === "beta" ? "beta" : "stable";
   $("patterns-file").value = s.patterns_file;
   $("patterns-file").placeholder = s.patterns_path;
   $("load-msg").textContent = s.load_message;
@@ -163,6 +165,8 @@ $("save-settings").addEventListener("click", async () => {
         show_toast: $("show-toast").checked,
         patterns_file: $("patterns-file").value,
         autostart: $("autostart").checked,
+        check_updates: $("check-updates").checked,
+        update_channel: $("update-channel").value,
       },
     });
     renderState(s);
