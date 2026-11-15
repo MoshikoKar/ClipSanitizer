@@ -1,3 +1,21 @@
 /src-tauri/target/
 /src-tauri/gen/
 *.log
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.p12
+credentials.json
+**/secrets/**
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / local
+.idea/
+*.swp
+*.swo
