@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Clip Sanitizer</title>
+  <style>
+    :root { --bg: #1b1f24; --text: #f2f4f7; --muted: #b6bec9; --ok: #2dd4bf; --info: #93c5fd; --error: #f97066; }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #ffffff; --text: #1b1f24; --muted: #5a6472; --ok: #0f766e; --info: #2563eb; --error: #b42318; }
+    }
+    html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+    .toast {
+      position: absolute; inset: 4px;
+      display: flex; align-items: center; gap: 12px;
+      padding: 0 16px;
+      background: var(--bg); color: var(--text);
+      border-radius: 10px;
+      border: 1px solid rgba(127, 127, 127, .28);
+      font: 13px/1.35 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      cursor: pointer;
+      animation: in .16s ease-out;
+    }
+    @keyframes in { from { transform: translateY(8px); opacity: 0; } }
+    .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
+    .toast.info .dot { background: var(--info); }
+    .toast.error .dot { background: var(--error); }
+    .title { font-weight: 600; }
+    .body { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 290px; }
+    .text { min-width: 0; }
+  </style>
+</head>
+<body>
+  <div class="toast" id="toast" title="Open Clip Sanitizer">
+    <span class="dot"></span>
+    <div class="text">
+      <div class="title" id="title">Clip Sanitizer</div>
+      <div class="body" id="body"></div>
+    </div>
+  </div>
+  <script src="toast.js"></script>
+</body>
+</html>
