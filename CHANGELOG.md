@@ -4,6 +4,20 @@ All notable changes to Clip Sanitizer are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-15
+
+### Added
+
+- Standard vs Strict sanitizing mode (Strict also redacts all URL hosts, system/Windows paths, and the organisation label)
+- Typed env PII placeholders (`<NAME>`, `<PHONE>`, `<ADDRESS>`, `<SSN>`, `<CARD>`, `<BANK_ACCOUNT>`, `<PASSPORT>`, `<DOB>`)
+- Learn organisation hosts from `DOMAIN=` / `HOSTNAME=` / `FQDN=` lines in the same text
+- Secret-store path redaction (`.ssh`, `.aws`, credentials dirs, and similar)
+- Update download progress toasts and automatic relaunch after Setup or portable swap
+
+### Changed
+
+- README documents Standard vs Strict mode
+
 ## [0.2.1] - 2026-11-15
 
 ### Added
