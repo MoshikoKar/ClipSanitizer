@@ -31,6 +31,12 @@
         <label><input type="checkbox" id="autostart"> Start with Windows</label>
         <label><input type="checkbox" id="check-updates"> Check for updates</label>
       </div>
+      <label>Sanitizing mode
+        <select id="mode">
+          <option value="standard">Standard - secrets, personal data, credentials</option>
+          <option value="strict">Strict - also all URL hosts, system paths, organisation name</option>
+        </select>
+      </label>
       <label>Update channel
         <select id="update-channel">
           <option value="stable">Stable</option>

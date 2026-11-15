@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const VALUE_GROUP: &str = "value";
 const HASH_LENGTH: usize = 12;
@@ -35,14 +36,22 @@ const ENV_SECRET_KEY: &str = concat!(
     r"|LENGTH|SIZE|COUNT|ROUNDS|ATTEMPTS|RETRIES|INTERVAL|PORT|FLAG|MODE|TYPE|URL|PATH|FILE|HEADER|ALGORITHM|FORMAT",
     r"|PREFIX|LIFETIME|DURATION|MAX|MIN|LIMIT)(?![A-Z0-9]))[A-Z0-9]+)*"
 );
-/// Whole-line env keys holding personal / financial data (names, phone, address, SSN, card, bank, passport, DOB).
-const ENV_PII_KEY: &str = concat!(
-    r"(?:[A-Z0-9]+_)*(?:SSN|SOCIAL_?SECURITY(?:_?(?:NUMBER|NO))?|PASSPORT(?:_?(?:NUMBER|NO))?",
-    r"|CARD_?(?:CVV2?|CVC|EXPIRY|EXP|NUMBER)|CVV2?|CVC|IBAN|(?:ROUTING|ACCOUNT|SWIFT)_?(?:NUMBER|NO)",
-    r"|DATE_?OF_?BIRTH|DOB|BIRTH_?DATE|(?:FULL|FIRST|LAST|CARDHOLDER|HOLDER|CONTACT)_?NAME",
-    r"|PHONE(?:_?NUMBER)?|MOBILE|TELEPHONE",
-    r"|(?<!IP_)(?<!MAC_)(?<!EMAIL_)(?<!MAIL_)(?<!BIND_)(?<!LISTEN_)(?<!HOST_)(?<!SERVER_)ADDRESS)"
-);
+/// Key alternations for whole-line personal / financial values; each gets its own placeholder.
+const KEY_NAME: &str = r"(?:FULL|FIRST|LAST|MIDDLE|MAIDEN|CARDHOLDER|HOLDER|CONTACT|CUSTOMER|PATIENT)_?NAME";
+const KEY_PHONE: &str = r"PHONE(?:_?NUMBER)?|MOBILE(?:_?(?:NUMBER|NO|PHONE))?|TELEPHONE|FAX(?:_?NUMBER)?";
+const KEY_ADDRESS: &str =
+    r"(?<!IP_)(?<!MAC_)(?<!EMAIL_)(?<!MAIL_)(?<!BIND_)(?<!LISTEN_)(?<!HOST_)(?<!SERVER_)(?<!WALLET_)ADDRESS";
+const KEY_SSN: &str = r"SSN|SOCIAL_?SECURITY(?:_?(?:NUMBER|NO))?|NATIONAL_?ID(?:_?(?:NUMBER|NO))?|TAX_?ID";
+const KEY_CARD: &str = r"CARD_?(?:NUMBER|NO|CVV2?|CVC|EXPIRY|EXP(?:IRATION)?(?:_?DATE)?)|CVV2?|CVC";
+const KEY_BANK: &str = r"IBAN|(?:ROUTING|ACCOUNT|BANK_?ACCOUNT|SWIFT|BIC|SORT)_?(?:NUMBER|NO|CODE)|BANK_?ACCOUNT";
+const KEY_PASSPORT: &str = r"PASSPORT(?:_?(?:NUMBER|NO))?";
+const KEY_DOB: &str = r"DATE_?OF_?BIRTH|DOB|BIRTH_?DATE";
+
+/// `UPPER_CASE_KEY` regex: optional prefix segments, then one of the alternatives.
+fn env_key(alternatives: &str) -> String {
+    format!("(?:[A-Z0-9]+_)*(?:{alternatives})")
+}
+
 /// Whole-line env keys naming this organisation's hosts / domains.
 const ENV_HOST_KEY: &str = r"(?:[A-Z0-9]+_)*(?:HOSTNAME|DOMAIN|FQDN)";
 
@@ -145,6 +154,8 @@ pub struct Pattern {
     pub gate: Vec<String>,
     pub validator: Option<Validator>,
     pub builtin: bool,
+    /// Only active in Strict mode.
+    pub strict_only: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -155,6 +166,7 @@ pub struct PatternInfo {
     pub hash: bool,
     pub case_sensitive: bool,
     pub builtin: bool,
+    pub strict_only: bool,
     pub comment: String,
     pub regex: String,
 }
@@ -332,16 +344,18 @@ struct Spec {
     hash: bool,
     gate: &'static [&'static str],
     validator: Option<Validator>,
+    strict: bool,
 }
 
 fn spec(name: &'static str, regex: impl Into<String>, replacement: &'static str, priority: i64, comment: &'static str) -> Spec {
-    Spec { name, regex: regex.into(), replacement, priority, comment, hash: false, gate: &[], validator: None }
+    Spec { name, regex: regex.into(), replacement, priority, comment, hash: false, gate: &[], validator: None, strict: false }
 }
 
 impl Spec {
     fn hashed(mut self) -> Self { self.hash = true; self }
     fn gate(mut self, g: &'static [&'static str]) -> Self { self.gate = g; self }
     fn validate(mut self, v: Validator) -> Self { self.validator = Some(v); self }
+    fn strict(mut self) -> Self { self.strict = true; self }
 }
 
 fn default_specs() -> Vec<Spec> {
@@ -373,11 +387,22 @@ fn default_specs() -> Vec<Spec> {
              "<SECRET>", 85, "Whole value of KEY=... lines whose key names a password / secret / token / key (incl. commented-out lines)")
             .hashed().validate(env_secret_ok)
             .gate(&["pass", "pwd", "secret", "token", "key", "credential", "seed", "mnemonic", "recovery", "auth_"]),
-        spec("EnvPII", env_line(ENV_PII_KEY), "<PII>", 85,
-             "Value of KEY=... lines holding names, phone, address, SSN, card, bank, passport or birth date")
-            .validate(pii_ok)
-            .gate(&["ssn", "social", "passport", "card", "cvv", "cvc", "iban", "routing", "account", "swift", "birth",
-                    "dob", "name", "phone", "mobile", "telephone", "address"]),
+        spec("EnvName", env_line(&env_key(KEY_NAME)), "<NAME>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["name"]),
+        spec("EnvPhone", env_line(&env_key(KEY_PHONE)), "<PHONE>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["phone", "mobile", "fax"]),
+        spec("EnvAddress", env_line(&env_key(KEY_ADDRESS)), "<ADDRESS>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["address"]),
+        spec("EnvSSN", env_line(&env_key(KEY_SSN)), "<SSN>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["ssn", "social", "national", "tax"]),
+        spec("EnvCard", env_line(&env_key(KEY_CARD)), "<CARD>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["card", "cvv", "cvc"]),
+        spec("EnvBank", env_line(&env_key(KEY_BANK)), "<BANK_ACCOUNT>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["iban", "routing", "account", "swift", "bic", "sort"]),
+        spec("EnvPassport", env_line(&env_key(KEY_PASSPORT)), "<PASSPORT>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["passport"]),
+        spec("EnvDOB", env_line(&env_key(KEY_DOB)), "<DOB>", 85, "Value of KEY=... lines whose key names this kind of personal data")
+            .validate(pii_ok).gate(&["birth", "dob"]),
         spec("EnvHost", env_line(ENV_HOST_KEY), "<HOST>", 85, "Value of HOSTNAME= / DOMAIN= / FQDN= lines")
             .validate(host_ok).gate(&["hostname", "domain", "fqdn"]),
         spec("SSN", r"(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])", "<SSN>", 66, "US social security numbers (structure-checked)")
@@ -393,6 +418,18 @@ fn default_specs() -> Vec<Spec> {
              "URL-encoded emails (user%40host.tld, also double / triple encoded)").gate(&["40"]),
         spec("UNCPath", r#"(?<![\w\\])\\\\[A-Za-z0-9_.$-]{2,}\\[^\s"'<>|]+"#, "<UNC_PATH>", 60, "Windows UNC paths (\\\\server\\share\\...)")
             .gate(&["\\\\"]),
+        spec("SecretPath", concat!(r#"(?<![\w:/.~-])(?:~|(?:/[\w.@+-]+)*?)/(?:credentials?|secrets?|private|\.ssh|\.aws|\.kube|\.gnupg|\.docker)"#,
+                                   r#"(?:/[^\s"'<>|;,]*)?(?![\w-])"#),
+             "<PATH>", 60, "Unix paths into credential stores (.../credentials/..., .ssh/, .aws/, .kube/, /run/secrets/...)")
+            .gate(&["credential", "secret", "private", ".ssh", ".aws", ".kube", ".gnupg", ".docker"]),
+        spec("DistinguishedName_DC", r"(?<![A-Za-z0-9])DC=(?P<value>[A-Za-z0-9-]+)", "<DC>", 55,
+             "Domain components of LDAP distinguished names").gate(&["dc="]),
+        spec("URLHost", r#"\b[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^/\s@]+@)?(?P<value>(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})(?=[:/?#\s"'<>]|$)"#,
+             "<HOST>", 46, "Strict: every host name in a URL / connection string").strict().gate(&["://"]),
+        spec("SystemPath", r"(?<![\w.~:/-])/(?:etc|opt|srv|mnt|root|run|var/lib)/[\w.@%+/-]+", "<PATH>", 44,
+             "Strict: Unix system, service and mount paths").strict().gate(&["/etc/", "/opt/", "/srv/", "/mnt/", "/root/", "/run/", "/var/lib/"]),
+        spec("WindowsPath", r#"(?<![\w])[A-Za-z]:\\(?:[^\\/\s"'<>|:*?]+\\)*[^\\/\s"'<>|:*?]+"#, "<PATH>", 44,
+             "Strict: absolute Windows paths").strict().gate(&[":\\"]),
         spec("AccessToken", kv(r"token", KV_VALUE, false, r"(?:access|auth|id|session)[-_]?token"), "<ACCESS_TOKEN>", 90,
              "token / access_token / auth-token values").hashed().validate(literal_ok).gate(&["token"]),
         spec("RefreshToken", kv(r"refresh[-_]?token", KV_VALUE, false, r"refresh[-_]?token"), "<REFRESH_TOKEN>", 91,
@@ -450,6 +487,7 @@ fn default_specs() -> Vec<Spec> {
 #[derive(Clone)]
 pub struct Engine {
     patterns: Vec<Pattern>, // kept sorted in application order
+    strict: bool,
 }
 
 impl Default for Engine {
@@ -477,13 +515,14 @@ impl Engine {
                 gate: s.gate.iter().map(|g| g.to_string()).collect(),
                 validator: s.validator,
                 builtin: true,
+                strict_only: s.strict,
             })
             .collect();
         let mut add = |name: &str, regex: String, repl: &str, comment: &str, gate: Vec<String>| {
             patterns.push(Pattern {
                 name: name.into(), regex: compile(&regex, false).expect("system pattern"), source: regex,
                 replacement: repl.into(), hash: false, enabled: true, case_sensitive: false, comment: comment.into(),
-                priority: 50, gate, validator: None, builtin: true,
+                priority: 50, gate, validator: None, builtin: true, strict_only: false,
             });
         };
         for (name, value, repl, comment) in [("Username", username, "<USERNAME>", "Current Windows user name"),
@@ -497,11 +536,19 @@ impl Engine {
                 format!(r"(?<![\w.@-])(?:[a-z0-9-]+\.)*{}(?:\.[a-z0-9-]+)+(?![\w-])", escape(&label)),
                 "<HOST>", "Host names of your organisation's domain (from the Windows DNS domain)", vec![label.clone()]);
         }
+        for (name, comment) in [("LearnedDomain", "Hosts under the organisation named by DOMAIN= / HOSTNAME= / FQDN= lines of the same text"),
+                                ("LearnedOrg", "Strict: the organisation label itself (names, projects, paths) learned the same way")] {
+            // Placeholder that never matches; `with_learned` swaps in the real regex per text.
+            add(name, r"[^\s\S]".into(), if name == "LearnedOrg" { "<ORG>" } else { "<HOST>" }, comment, vec!["\u{0}".into()]);
+        }
         add("FilePath_Username",
             concat!(r#"(?:(?<=[\\/]Users[\\/])|(?<=[\\/]home[\\/]))(?!(?:Public|Default|All Users|Shared)[\\/])"#,
                     r#"(?:[^\\/\r\n"'<>|:*?]+(?=[\\/])|[^\\/\s"'<>|:*?]+)"#).to_string(),
             "<USERNAME>", "Any user name in C:\\Users\\<name> or /home/<name> paths", vec!["users".into(), "home".into()]);
-        let mut engine = Engine { patterns };
+        if let Some(p) = patterns.iter_mut().find(|p| p.name == "LearnedOrg") {
+            p.strict_only = true;
+        }
+        let mut engine = Engine { patterns, strict: false };
         engine.sort();
         engine
     }
@@ -512,12 +559,57 @@ impl Engine {
         });
     }
 
+    /// Strict mode also enables the `strict_only` patterns (all URL hosts, system paths, the organisation label ...).
+    pub fn set_strict(&mut self, strict: bool) {
+        self.strict = strict;
+    }
+
+    /// If the text declares its own organisation (`DOMAIN=corp.acme.com`, `HOSTNAME=...`), returns a copy of the
+    /// engine whose `LearnedDomain` / `LearnedOrg` patterns target that organisation. Bounded to 8 labels.
+    fn with_learned(&self, text: &str) -> Option<Engine> {
+        if !(text.contains("DOMAIN") || text.contains("HOSTNAME") || text.contains("FQDN")) {
+            return None;
+        }
+        static DECLARED: OnceLock<Regex> = OnceLock::new();
+        let re = DECLARED.get_or_init(|| {
+            Regex::new(r#"(?m)^[ \t]*(?:export[ \t]+)?(?:[A-Z0-9]+_)*(?:DOMAIN|HOSTNAME|FQDN)[ \t]*[=:][ \t]*["']?([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})"#)
+                .expect("declared-domain regex")
+        });
+        let mut labels: Vec<String> = Vec::new();
+        for caps in re.captures_iter(text).flatten() {
+            if let Some(l) = org_label(&caps[1]) {
+                if !labels.contains(&l) {
+                    labels.push(l);
+                }
+            }
+            if labels.len() >= 8 {
+                break;
+            }
+        }
+        if labels.is_empty() {
+            return None;
+        }
+        let alt = labels.iter().map(|l| escape(l)).collect::<Vec<_>>().join("|");
+        let mut engine = self.clone();
+        for p in engine.patterns.iter_mut() {
+            let source = match p.name.as_str() {
+                "LearnedDomain" => format!(r"(?<![\w.-])(?:[a-z0-9-]+\.)*(?:{alt})(?:\.[a-z0-9-]+)+(?![\w-])"),
+                "LearnedOrg" => format!(r"(?<![A-Za-z0-9])(?:{alt})(?![A-Za-z0-9])"),
+                _ => continue,
+            };
+            p.regex = compile(&source, false).ok()?;
+            p.source = source;
+            p.gate = labels.clone();
+        }
+        Some(engine)
+    }
+
     pub fn patterns(&self) -> Vec<PatternInfo> {
         self.patterns
             .iter()
             .map(|p| PatternInfo {
                 name: p.name.clone(), enabled: p.enabled, priority: p.priority, hash: p.hash,
-                case_sensitive: p.case_sensitive, builtin: p.builtin, comment: p.comment.clone(), regex: p.source.clone(),
+                case_sensitive: p.case_sensitive, builtin: p.builtin, strict_only: p.strict_only, comment: p.comment.clone(), regex: p.source.clone(),
             })
             .collect()
     }
@@ -593,18 +685,26 @@ impl Engine {
             gate: vec![],
             validator: None,
             builtin: false,
+            strict_only: false,
         })
     }
 
     /// Sanitize `text`. `salt` keys the HMAC; use a fresh random salt per run.
     pub fn sanitize(&self, text: &str, salt: &[u8]) -> SanitizeResult {
+        match self.with_learned(text) {
+            Some(engine) => engine.sanitize_core(text, salt),
+            None => self.sanitize_core(text, salt),
+        }
+    }
+
+    fn sanitize_core(&self, text: &str, salt: &[u8]) -> SanitizeResult {
         let lowered = text.to_lowercase();
         let template_re = Regex::new(r"\\(?:\d|g<)").unwrap();
         let mut accepted: Vec<(usize, usize, String, usize)> = Vec::new();
         let mut warnings = Vec::new();
 
         for (idx, p) in self.patterns.iter().enumerate() {
-            if !p.enabled || (!p.gate.is_empty() && !p.gate.iter().any(|g| lowered.contains(g.as_str()))) {
+            if !p.enabled || (p.strict_only && !self.strict) || (!p.gate.is_empty() && !p.gate.iter().any(|g| lowered.contains(g.as_str()))) {
                 continue;
             }
             let value_group = p.regex.capture_names().any(|n| n == Some(VALUE_GROUP));
@@ -924,6 +1024,89 @@ mod tests {
         );
         assert_eq!(clean(keep), keep);
         assert_eq!(clean("DB_USER=\nDB_HOST=db1\n"), "DB_USER=\nDB_HOST=db1\n");
+    }
+
+    fn strict_clean(text: &str) -> String {
+        let mut e = engine();
+        e.set_strict(true);
+        e.sanitize(text, b"salt").text
+    }
+
+    #[test]
+    fn precise_placeholders() {
+        for (line, want) in [
+            ("ADMIN_FULL_NAME=Ann Lee", "ADMIN_FULL_NAME=<NAME>"),
+            ("CARDHOLDER_NAME=Ann Lee", "CARDHOLDER_NAME=<NAME>"),
+            ("SUPPORT_PHONE=+1-202-555-0100", "SUPPORT_PHONE=<PHONE>"),
+            ("HOME_ADDRESS=1 Main St, Springfield", "HOME_ADDRESS=<ADDRESS>"),
+            ("SSN=123-45-6789", "SSN=<SSN>"),
+            ("CARD_CVV=123", "CARD_CVV=<CARD>"),
+            ("CARD_EXPIRY=08/29", "CARD_EXPIRY=<CARD>"),
+            ("IBAN=GB82WEST12345698765432", "IBAN=<BANK_ACCOUNT>"),
+            ("US_ACCOUNT_NUMBER=000123456789", "US_ACCOUNT_NUMBER=<BANK_ACCOUNT>"),
+            ("PASSPORT_NUMBER=X1234567", "PASSPORT_NUMBER=<PASSPORT>"),
+            ("DATE_OF_BIRTH=1990-01-31", "DATE_OF_BIRTH=<DOB>"),
+            ("note: card 4111 1111 1111 1111", "note: card <CARD>"),
+        ] {
+            assert_eq!(clean(line), want, "{line}");
+        }
+        assert!(!clean("SOME_ENV=1").contains("<"));
+    }
+
+    #[test]
+    fn learns_the_declared_organisation() {
+        let env = concat!(
+            "DOMAIN=corp.acme.example\n",
+            "APP_URL=https://ops.acme.example/x\nLDAP=ldaps://dc01.corp.acme.example:636\n",
+            "DB_NAME=acme-archive\nPUBLIC=https://api.github.com/v3\nPATH_X=/etc/acme/app.conf\n",
+            "BIND=CN=svc,OU=Svc,DC=corp,DC=acme,DC=example\n",
+        );
+        let std = clean(env);
+        assert!(std.contains("DOMAIN=<HOST>") && std.contains("APP_URL=https://<HOST>/x"), "{std}");
+        assert!(std.contains("LDAP=ldaps://<HOST>:<PORT>") && std.contains("DC=<DC>"), "{std}");
+        assert!(std.contains("api.github.com") && std.contains("acme-archive") && std.contains("/etc/acme/app.conf"), "{std}");
+        let strict = strict_clean(env);
+        for kept in ["acme", "github", "/etc/"] {
+            assert!(!strict.contains(kept), "strict kept {kept}:\n{strict}");
+        }
+        let db = clean("DOMAIN=corp.acme.example
+M=mongodb://u:p@db.corp.acme.example/x mail a@acme.example");
+        assert!(db.contains("M=mongodb://<CREDENTIALS>@<HOST>/x mail <EMAIL>"), "{db}");
+        // Without a declared organisation nothing is learned.
+        assert_eq!(clean("APP_URL=https://ops.acme.example/x"), "APP_URL=https://ops.acme.example/x");
+    }
+
+    #[test]
+    fn path_policy() {
+        let keep = r"log /var/log/app/error.log cfg /etc/hosts bin C:\Windows\System32\cmd.exe see https://x.example/secrets-guide";
+        assert_eq!(clean(keep), keep);
+        let out = clean(r"KEY_FILE=/etc/app/credentials/prod.json and ~/.ssh/id_rsa and \\fs01\share\hr");
+        assert_eq!(out, "KEY_FILE=<PATH> and <PATH> and <UNC_PATH>");
+        let out = strict_clean(r"cfg /etc/hosts bin C:\Windows\System32\cmd.exe");
+        assert_eq!(out, "cfg <PATH> bin <PATH>");
+    }
+
+    #[test]
+    fn modes_and_overlaps() {
+        let src = "u=https://git.vendor.net/r.git?token=abc123xyz987 pass=Zk3q9Wm";
+        assert!(clean(src).contains("git.vendor.net"));
+        let strict = strict_clean(src);
+        assert!(strict.contains("https://<HOST>/r.git") && !strict.contains("abc123xyz987"), "{strict}");
+        // Several secrets and personal values on one line, plus a key block in between.
+        let out = clean("a password=Pw1!x b a@b.example c +44 20 7946 0958 d ssn 123-45-6789 e 10.0.0.1:80");
+        for leak in ["Pw1!x", "a@b.example", "7946", "123-45-6789", "10.0.0.1"] {
+            assert!(!out.contains(leak), "{out}");
+        }
+    }
+
+    #[test]
+    fn partially_redacted_input_is_stable() {
+        for t in ["password=<PASSWORD>", "postgres://<CREDENTIALS>@db.example.org/x", "API_KEY=<HASHED_APIKEY_0123456789AB>",
+                  "mail <EMAIL> from <IP>:<PORT> user=<USER>", "TOKEN=<SECRET>"] {
+            assert_eq!(clean(t), t);
+        }
+        let out = clean("postgres://svc:<PASSWORD>@db.example.org/x");
+        assert!(out.starts_with("postgres://<CREDENTIALS>@"), "{out}");
     }
 
     #[test]

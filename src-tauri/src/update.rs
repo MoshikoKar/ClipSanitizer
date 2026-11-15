@@ -385,13 +385,19 @@ pub fn check_for_update(channel: UpdateChannel) -> Result<Option<AvailableUpdate
 }
 
 /// Download, verify, and start install/swap. Returns `true` if the app should exit so the update can finish.
-pub fn download_verify_and_apply(update: &AvailableUpdate) -> Result<bool, String> {
+///
+/// `on_progress` is called with short status strings (safe to show in a toast).
+pub fn download_verify_and_apply<F>(update: &AvailableUpdate, mut on_progress: F) -> Result<bool, String>
+where
+    F: FnMut(&str),
+{
     let installed = is_installed_mode();
     let dir = temp_update_dir()?;
     let sums_path = dir.join(SUMS_ASSET);
     let asset_path = dir.join(&update.asset_name);
 
     let apply = (|| -> Result<bool, String> {
+        on_progress("Downloading checksums...");
         curl_download(&update.sums_url, &sums_path)?;
         let sums_body =
             fs::read_to_string(&sums_path).map_err(|e| format!("Could not read {SUMS_ASSET}: {e}"))?;
@@ -399,7 +405,9 @@ pub fn download_verify_and_apply(update: &AvailableUpdate) -> Result<bool, Strin
             format!("{SUMS_ASSET} has no SHA-256 entry for {}", update.asset_name)
         })?;
 
+        on_progress(&format!("Downloading {}...", update.asset_name));
         curl_download(&update.asset_url, &asset_path)?;
+        on_progress("Verifying SHA-256...");
         let actual = file_sha256_hex(&asset_path)?;
         if actual != expected {
             let _ = fs::remove_file(&asset_path);
@@ -409,8 +417,13 @@ pub fn download_verify_and_apply(update: &AvailableUpdate) -> Result<bool, Strin
             ));
         }
 
+        on_progress(if installed {
+            "Starting installer; the app will restart..."
+        } else {
+            "Installing update; the app will restart..."
+        });
         if installed {
-            start_setup_silent(&asset_path)?;
+            start_setup_and_relaunch(&asset_path)?;
         } else {
             start_portable_swap(&asset_path)?;
         }
@@ -423,57 +436,134 @@ pub fn download_verify_and_apply(update: &AvailableUpdate) -> Result<bool, Strin
     apply
 }
 
-fn start_setup_silent(setup: &Path) -> Result<(), String> {
-    let mut cmd = Command::new(setup);
-    // Tauri NSIS uses /S; Inno-style assets (if ever used) accept /SILENT.
-    cmd.args(["/S"]);
+fn normalize_exe_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn update_log_path() -> PathBuf {
+    std::env::temp_dir().join("ClipSanitizer-update.log")
+}
+
+/// Shared PowerShell helper: wait for our PID, then run `$Action`, then relaunch the exe with retries.
+fn spawn_update_helper(action_ps: &str, extra_env: &[(&str, String)]) -> Result<(), String> {
+    let exe = normalize_exe_path(
+        &std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?,
+    );
+    let pid = std::process::id();
+    let log = update_log_path();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$log = $env:CLIP_SANITIZER_UPDATE_LOG
+function Write-UpdateLog([string]$msg) {{
+  $line = '{{0:u}} {{1}}' -f (Get-Date), $msg
+  Add-Content -LiteralPath $log -Value $line -ErrorAction SilentlyContinue
+}}
+try {{
+  $pidToWait = [int]$env:CLIP_SANITIZER_UPDATE_PID
+  $exe = $env:CLIP_SANITIZER_UPDATE_EXE
+  $dir = Split-Path -Parent $exe
+  Write-UpdateLog "helper start; wait pid=$pidToWait exe=$exe"
+  try {{ Wait-Process -Id $pidToWait -Timeout 90 -ErrorAction SilentlyContinue }} catch {{}}
+  Start-Sleep -Seconds 2
+  {action}
+  Write-UpdateLog 'action done; relaunching'
+  $launched = $false
+  for ($i = 0; $i -lt 8; $i++) {{
+    try {{
+      Start-Process -FilePath $exe -WorkingDirectory $dir
+      $launched = $true
+      Write-UpdateLog "Start-Process ok (try $i)"
+      break
+    }} catch {{
+      Write-UpdateLog ("Start-Process failed try=$i err=" + $_.Exception.Message)
+      Start-Sleep -Seconds 1
+    }}
+  }}
+  if (-not $launched) {{ throw 'Could not relaunch Clip Sanitizer after update' }}
+}} catch {{
+  Write-UpdateLog ("FATAL: " + $_.Exception.Message)
+  $msg = "Clip Sanitizer update finished, but automatic restart failed.`n`n" + $_.Exception.Message + "`n`nStart the app manually. Log: $log"
+  Add-Type -AssemblyName System.Windows.Forms
+  [System.Windows.Forms.MessageBox]::Show($msg, 'Clip Sanitizer update', 'OK', 'Warning') | Out-Null
+  exit 1
+}}
+"#,
+        action = action_ps
+    );
+
+    let script_path = std::env::temp_dir().join(format!("ClipSanitizer-update-helper-{pid}.ps1"));
+    fs::write(&script_path, script).map_err(|e| format!("Could not write update helper: {e}"))?;
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        script_path.to_str().ok_or("Helper path is not valid UTF-8")?,
+    ])
+    .env("CLIP_SANITIZER_UPDATE_PID", pid.to_string())
+    .env("CLIP_SANITIZER_UPDATE_EXE", exe.to_string_lossy().as_ref())
+    .env("CLIP_SANITIZER_UPDATE_LOG", log.to_string_lossy().as_ref())
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.spawn()
         .map(|_| ())
-        .map_err(|e| format!("Could not start installer: {e}"))
+        .map_err(|e| format!("Could not start update helper: {e}"))
+}
+
+fn start_setup_and_relaunch(setup: &Path) -> Result<(), String> {
+    let setup = normalize_exe_path(setup);
+    spawn_update_helper(
+        r#"
+  $setup = $env:CLIP_SANITIZER_UPDATE_SETUP
+  Write-UpdateLog "running setup=$setup"
+  $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru -Wait
+  Write-UpdateLog ("setup exit=" + $p.ExitCode)
+  Start-Sleep -Seconds 1
+"#,
+        &[("CLIP_SANITIZER_UPDATE_SETUP", setup.to_string_lossy().into_owned())],
+    )
 }
 
 fn start_portable_swap(zip: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let pid = std::process::id();
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$pidToWait = [int]$env:CLIP_SANITIZER_UPDATE_PID
-$zip = $env:CLIP_SANITIZER_UPDATE_ZIP
-$exe = $env:CLIP_SANITIZER_UPDATE_EXE
-$dir = Split-Path -Parent $exe
-$extract = Join-Path $dir '.clip-sanitizer-update'
-try { Wait-Process -Id $pidToWait -Timeout 60 -ErrorAction SilentlyContinue } catch {}
-Start-Sleep -Milliseconds 400
-if (Test-Path $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
-Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
-$newExe = Get-ChildItem -LiteralPath $extract -Filter '*.exe' -File | Select-Object -First 1
-if (-not $newExe) { throw 'No .exe in portable zip' }
-$bak = "$exe.bak"
-if (Test-Path -LiteralPath $exe) { Copy-Item -LiteralPath $exe -Destination $bak -Force }
-Copy-Item -LiteralPath $newExe.FullName -Destination $exe -Force
-$portableMarker = Join-Path $extract 'portable.txt'
-if (Test-Path -LiteralPath $portableMarker) {
-  Copy-Item -LiteralPath $portableMarker -Destination (Join-Path $dir 'portable.txt') -Force
-}
-Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-Start-Process -FilePath $exe
-"#;
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .env("CLIP_SANITIZER_UPDATE_PID", pid.to_string())
-        .env("CLIP_SANITIZER_UPDATE_ZIP", zip.to_string_lossy().as_ref())
-        .env("CLIP_SANITIZER_UPDATE_EXE", exe.to_string_lossy().as_ref())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Could not start portable update helper: {e}"))
+    let zip = normalize_exe_path(zip);
+    spawn_update_helper(
+        r#"
+  $zip = $env:CLIP_SANITIZER_UPDATE_ZIP
+  $extract = Join-Path $dir '.clip-sanitizer-update'
+  Write-UpdateLog "portable zip=$zip"
+  if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+  Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+  $newExe = Get-ChildItem -LiteralPath $extract -Filter '*.exe' -File | Select-Object -First 1
+  if (-not $newExe) { throw 'No .exe in portable zip' }
+  $bak = "$exe.bak"
+  if (Test-Path -LiteralPath $exe) { Copy-Item -LiteralPath $exe -Destination $bak -Force }
+  Copy-Item -LiteralPath $newExe.FullName -Destination $exe -Force
+  $portableMarker = Join-Path $extract 'portable.txt'
+  if (Test-Path -LiteralPath $portableMarker) {
+    Copy-Item -LiteralPath $portableMarker -Destination (Join-Path $dir 'portable.txt') -Force
+  }
+  Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+  Write-UpdateLog 'portable swap complete'
+"#,
+        &[("CLIP_SANITIZER_UPDATE_ZIP", zip.to_string_lossy().into_owned())],
+    )
 }
 
 #[cfg(windows)]
@@ -505,16 +595,28 @@ fn ask_install(update: &AvailableUpdate) -> bool {
     let notes = if notes.is_empty() {
         String::new()
     } else {
-        let short: String = notes.chars().take(400).collect();
+        let short: String = notes.chars().take(280).collect();
         format!("\n\n{short}")
     };
     let body = format!(
-        "Clip Sanitizer {} is available (you have {}).\n\nDownload and install now?{notes}\n\n{}",
+        "Clip Sanitizer {} is available (you have {}).\n\n\
+         Download and install now?\n\n\
+         After Yes: the update downloads (tray toast shows progress), then the app \
+         closes and restarts automatically.{notes}\n\n{}",
         update.version.display(),
         current_version().display(),
         update.html_url
     );
     message_box("Clip Sanitizer update", &body, true) == IDYES
+}
+
+fn confirm_restart() {
+    inform(
+        "Update ready",
+        "The update was downloaded and verified.\n\n\
+         Click OK to close Clip Sanitizer. It will restart with the new version in a few seconds.\n\n\
+         If it does not reopen, start it from the Start menu or the portable folder.",
+    );
 }
 
 fn inform(title: &str, body: &str) {
@@ -539,8 +641,28 @@ pub struct CheckOutcome {
     pub dismissed_version: Option<String>,
 }
 
+fn apply_accepted_update<F>(update: &AvailableUpdate, on_progress: F) -> CheckOutcome
+where
+    F: FnMut(&str),
+{
+    match download_verify_and_apply(update, on_progress) {
+        Ok(true) => {
+            confirm_restart();
+            CheckOutcome { should_exit: true, dismissed_version: None }
+        }
+        Ok(false) => CheckOutcome { should_exit: false, dismissed_version: None },
+        Err(e) => {
+            inform("Update failed", &e);
+            CheckOutcome { should_exit: false, dismissed_version: None }
+        }
+    }
+}
+
 /// Manual "Check for updates": always reports the result.
-pub fn run_manual_check(channel: UpdateChannel) -> CheckOutcome {
+pub fn run_manual_check<F>(channel: UpdateChannel, mut on_progress: F) -> CheckOutcome
+where
+    F: FnMut(&str),
+{
     if !try_begin_check() {
         inform("Clip Sanitizer", "An update check is already running.");
         return CheckOutcome { should_exit: false, dismissed_version: None };
@@ -561,14 +683,8 @@ pub fn run_manual_check(channel: UpdateChannel) -> CheckOutcome {
                         dismissed_version: Some(update.version.display()),
                     };
                 }
-                match download_verify_and_apply(&update) {
-                    Ok(true) => CheckOutcome { should_exit: true, dismissed_version: None },
-                    Ok(false) => CheckOutcome { should_exit: false, dismissed_version: None },
-                    Err(e) => {
-                        inform("Update failed", &e);
-                        CheckOutcome { should_exit: false, dismissed_version: None }
-                    }
-                }
+                on_progress("Downloading update...");
+                apply_accepted_update(&update, on_progress)
             }
             Err(e) => {
                 inform("Update check failed", &e);
@@ -582,7 +698,10 @@ pub fn run_manual_check(channel: UpdateChannel) -> CheckOutcome {
 
 /// Background check: silent when up to date or offline; prompts only when a newer release exists
 /// and that version was not dismissed.
-pub fn run_auto_check(channel: UpdateChannel, dismissed: &str) -> CheckOutcome {
+pub fn run_auto_check<F>(channel: UpdateChannel, dismissed: &str, mut on_progress: F) -> CheckOutcome
+where
+    F: FnMut(&str),
+{
     if !try_begin_check() {
         return CheckOutcome { should_exit: false, dismissed_version: None };
     }
@@ -602,14 +721,8 @@ pub fn run_auto_check(channel: UpdateChannel, dismissed: &str) -> CheckOutcome {
                 dismissed_version: Some(update.version.display()),
             };
         }
-        match download_verify_and_apply(&update) {
-            Ok(true) => CheckOutcome { should_exit: true, dismissed_version: None },
-            Ok(false) => CheckOutcome { should_exit: false, dismissed_version: None },
-            Err(e) => {
-                inform("Update failed", &e);
-                CheckOutcome { should_exit: false, dismissed_version: None }
-            }
-        }
+        on_progress("Downloading update...");
+        apply_accepted_update(&update, on_progress)
     })();
     end_check();
     outcome

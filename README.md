@@ -63,6 +63,9 @@ The window also lets you switch individual patterns on or off. **Settings** cove
 - *Also paste over the selection*, which replaces the selected text in place
 - notifications on or off
 - start with Windows
+- sanitizing mode: **Standard** (secrets, personal data, credentials) or **Strict**
+  (also every URL host, system/Windows paths, and the organisation name learned
+  from `DOMAIN=` / `HOSTNAME=` / `FQDN=` lines in the same text)
 - which patterns file to use
 - check for updates on/off and update channel (`stable` or `beta`)
 
@@ -114,6 +117,7 @@ cargo run
 ## Features
 
 - Global hotkey sanitize (selection or clipboard fallback)
+- Standard and Strict sanitizing modes
 - System tray with pause, sanitize-now, and settings entry points
 - In-app sanitize window with pattern toggles and highlighted output
 - Shared Log Sanitizer pattern / config format

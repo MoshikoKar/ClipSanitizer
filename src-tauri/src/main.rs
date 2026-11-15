@@ -39,6 +39,8 @@ struct Settings {
     update_channel: String,
     /// Last update version the user dismissed (skip auto-prompt until a different version).
     dismissed_update_version: String,
+    /// `standard` or `strict` (also hides every URL host, system / Windows paths and the organisation name).
+    mode: String,
 }
 
 impl Default for Settings {
@@ -52,6 +54,7 @@ impl Default for Settings {
             check_updates: true,
             update_channel: "stable".into(),
             dismissed_update_version: String::new(),
+            mode: "standard".into(),
         }
     }
 }
@@ -100,6 +103,7 @@ fn save_settings_file(app: &AppHandle, s: &Settings) -> Result<(), String> {
 /// Built-ins + the patterns file + the UI's disabled list.
 fn build_engine(app: &AppHandle, s: &Settings) -> (Engine, String) {
     let mut engine = Engine::default();
+    engine.set_strict(s.mode == "strict");
     let path = patterns_path(app, s);
     if !path.exists() && s.patterns_file.trim().is_empty() {
         let starter = "{\n  \"patterns\": []\n}\n";
@@ -372,6 +376,7 @@ struct StateView {
     paused: bool,
     check_updates: bool,
     update_channel: String,
+    mode: String,
     load_message: String,
     patterns: Vec<PatternInfo>,
 }
@@ -388,6 +393,7 @@ fn view(app: &AppHandle, state: &State<AppState>) -> StateView {
         paused: state.paused.load(Ordering::SeqCst),
         check_updates: s.check_updates,
         update_channel: s.update_channel,
+        mode: s.mode,
         load_message: state.load_message.lock().unwrap().clone(),
         patterns: state.engine.lock().unwrap().patterns(),
     }
@@ -433,6 +439,7 @@ struct SettingsInput {
     autostart: bool,
     check_updates: bool,
     update_channel: String,
+    mode: String,
 }
 
 #[tauri::command]
@@ -454,7 +461,9 @@ fn save_settings(input: SettingsInput, app: AppHandle, state: State<AppState>) -
         "beta" => "beta".into(),
         _ => "stable".into(),
     };
+    new.mode = if input.mode.trim().eq_ignore_ascii_case("strict") { "strict".into() } else { "standard".into() };
     save_settings_file(&app, &new)?;
+    state.engine.lock().unwrap().set_strict(new.mode == "strict");
     let reload = new.patterns_file != old.patterns_file;
     *state.settings.lock().unwrap() = new.clone();
     if reload {
@@ -485,10 +494,14 @@ fn run_update_check(app: &AppHandle, manual: bool) {
     if !manual && !enabled {
         return;
     }
+    let app_for_progress = app.clone();
+    let on_progress = move |msg: &str| {
+        toast(&app_for_progress, "info", "Updating Clip Sanitizer", msg);
+    };
     let outcome = if manual {
-        run_manual_check(channel)
+        run_manual_check(channel, on_progress)
     } else {
-        run_auto_check(channel, &dismissed)
+        run_auto_check(channel, &dismissed, on_progress)
     };
     if let Some(ver) = outcome.dismissed_version {
         let mut s = state.settings.lock().unwrap();
@@ -496,6 +509,8 @@ fn run_update_check(app: &AppHandle, manual: bool) {
         let _ = save_settings_file(app, &s);
     }
     if outcome.should_exit {
+        // Give the helper a moment to attach Wait-Process before we disappear.
+        std::thread::sleep(Duration::from_millis(400));
         app.exit(0);
     }
 }

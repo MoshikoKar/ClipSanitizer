@@ -19,6 +19,7 @@ function renderState(s) {
   $("autostart").checked = s.autostart;
   $("check-updates").checked = s.check_updates;
   $("update-channel").value = s.update_channel === "beta" ? "beta" : "stable";
+  $("mode").value = s.mode === "strict" ? "strict" : "standard";
   $("patterns-file").value = s.patterns_file;
   $("patterns-file").placeholder = s.patterns_path;
   $("load-msg").textContent = s.load_message;
@@ -167,6 +168,7 @@ $("save-settings").addEventListener("click", async () => {
         autostart: $("autostart").checked,
         check_updates: $("check-updates").checked,
         update_channel: $("update-channel").value,
+        mode: $("mode").value,
       },
     });
     renderState(s);
