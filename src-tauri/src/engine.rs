@@ -26,8 +26,91 @@ const ENV_SUFFIX: &str = r"(?:[-_](?i:dev|development|prod|production|staging|st
 const SECRETISH: &str = r#"(?=[^\s,;"'&]*[0-9!@#$%^*_+=/\\~?])"#;
 /// Whole-line UPPER_CASE env key (`ADMIN_PASSWORD=...`) with a secret-ish segment. Upper case only, so
 /// log lines like `password=abc user=bob` keep the per-token rules.
-const ENV_SECRET_KEY: &str =
-    r"(?:[A-Z0-9]+_)*(?:PASS(?:WORD|WD|PHRASE)?|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIALS?)(?:_[A-Z0-9]+)*";
+const ENV_SECRET_KEY: &str = concat!(
+    r"(?:[A-Z0-9]+_)*(?:PASS(?:WORD|WD|PHRASE)?|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIALS?",
+    r"|(?:TOTP|HOTP|OTP|MFA|2FA)_?SEED|SEED_?PHRASE|MNEMONIC|RECOVERY_?CODES?|AUTH_\d+)",
+    // A trailing segment naming a setting (SECRET_BUILD_VERSION, TOKEN_TIMEOUT_MS, PASSWORD_MIN_LENGTH ...)
+    // means the key describes configuration about a secret, not the secret itself.
+    r"(?:_(?!(?:ENABLED|DISABLED|ENABLE|REQUIRED|VERSION|BUILD|TIMEOUT|MS|SECONDS|MINUTES|HOURS|DAYS|TTL|EXPIRES|EXPIRY",
+    r"|LENGTH|SIZE|COUNT|ROUNDS|ATTEMPTS|RETRIES|INTERVAL|PORT|FLAG|MODE|TYPE|URL|PATH|FILE|HEADER|ALGORITHM|FORMAT",
+    r"|PREFIX|LIFETIME|DURATION|MAX|MIN|LIMIT)(?![A-Z0-9]))[A-Z0-9]+)*"
+);
+/// Whole-line env keys holding personal / financial data (names, phone, address, SSN, card, bank, passport, DOB).
+const ENV_PII_KEY: &str = concat!(
+    r"(?:[A-Z0-9]+_)*(?:SSN|SOCIAL_?SECURITY(?:_?(?:NUMBER|NO))?|PASSPORT(?:_?(?:NUMBER|NO))?",
+    r"|CARD_?(?:CVV2?|CVC|EXPIRY|EXP|NUMBER)|CVV2?|CVC|IBAN|(?:ROUTING|ACCOUNT|SWIFT)_?(?:NUMBER|NO)",
+    r"|DATE_?OF_?BIRTH|DOB|BIRTH_?DATE|(?:FULL|FIRST|LAST|CARDHOLDER|HOLDER|CONTACT)_?NAME",
+    r"|PHONE(?:_?NUMBER)?|MOBILE|TELEPHONE",
+    r"|(?<!IP_)(?<!MAC_)(?<!EMAIL_)(?<!MAIL_)(?<!BIND_)(?<!LISTEN_)(?<!HOST_)(?<!SERVER_)ADDRESS)"
+);
+/// Whole-line env keys naming this organisation's hosts / domains.
+const ENV_HOST_KEY: &str = r"(?:[A-Z0-9]+_)*(?:HOSTNAME|DOMAIN|FQDN)";
+
+/// `KEY=value` line regex (value captured as `value`); the value runs to the end of the line.
+fn env_line(key: &str) -> String {
+    format!(
+        concat!(r#"(?m)^[ \t]*(?:#[ \t]*)?(?:export[ \t]+)?{key}[ \t]*[=:][ \t]*["']?"#,
+                r#"(?P<value>(?<=")[^"\r\n]+(?=")|(?<=')[^'\r\n]+(?=')"#,
+                r#"|[^\s"'](?:(?![ \t]+[A-Za-z_][\w.-]*=)[^\r\n])*(?<![ \t]))"#),
+        key = key
+    )
+}
+
+fn is_version_like(value: &str) -> bool {
+    let v = value.trim_start_matches(['v', 'V']);
+    let parts: Vec<&str> = v.split('.').collect();
+    (2..=4).contains(&parts.len()) && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Booleans, null-ish words and version numbers are never secrets, whatever the key says.
+fn literal_ok(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    !(["true", "false", "yes", "no", "on", "off", "null", "none", "nil", "undefined"].contains(&v.as_str()) || is_version_like(&v))
+}
+
+/// A value that is already one of our placeholders (`<EMAIL>`, `<HASHED_PASSWORD_AB12...>`) must not be re-sanitized.
+fn is_placeholder(value: &str) -> bool {
+    value.len() > 2
+        && value.starts_with('<')
+        && value.ends_with('>')
+        && value[1..value.len() - 1].chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == ':')
+}
+
+fn digit_count(value: &str) -> usize {
+    value.chars().filter(char::is_ascii_digit).count()
+}
+
+fn phone_ok(value: &str) -> bool {
+    (8..=15).contains(&digit_count(value))
+}
+
+/// US SSN structure: area not 000/666/9xx, group not 00, serial not 0000.
+fn ssn_ok(value: &str) -> bool {
+    let p: Vec<&str> = value.split('-').collect();
+    p.len() == 3 && !matches!(p[0], "000" | "666") && !p[0].starts_with('9') && p[1] != "00" && p[2] != "0000"
+}
+
+/// ISO 13616 mod-97 check, so only real IBANs match.
+fn iban_ok(value: &str) -> bool {
+    let s: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    if !(15..=34).contains(&s.len()) {
+        return false;
+    }
+    let rem = s[4..].chars().chain(s[..4].chars()).try_fold(0u32, |rem, c| {
+        let d = c.to_digit(36)?;
+        Some(if d >= 10 { (rem * 100 + d) % 97 } else { (rem * 10 + d) % 97 })
+    });
+    rem == Some(1)
+}
+
+fn pii_ok(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    !(v.starts_with("${") || ["true", "false", "yes", "no", "on", "off", "null", "none"].contains(&v.as_str()))
+}
+
+fn host_ok(value: &str) -> bool {
+    pii_ok(value) && !["localhost", "127.0.0.1"].contains(&value.trim().to_ascii_lowercase().as_str())
+}
 const IPV4_OCTET: &str = r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)";
 const HEX: &str = "[0-9a-fA-F]";
 
@@ -145,6 +228,9 @@ fn ipv6_ok(value: &str) -> bool {
 /// Skip config-looking values under a secret-ish key: PASSWORD_MIN_LENGTH=8, TOKEN_EXPIRES_IN=24h, *_ENABLED=true.
 fn env_secret_ok(value: &str) -> bool {
     let v = value.to_ascii_lowercase();
+    if is_version_like(&v) {
+        return false;
+    }
     let duration = v.len() > 1 && v[..v.len() - 1].chars().all(|c| c.is_ascii_digit()) && "smhdw".contains(&v[v.len() - 1..]);
     let short_number = v.len() <= 4 && v.chars().all(|c| c.is_ascii_digit());
     !(duration || short_number || ["true", "false", "yes", "no", "on", "off", "null", "none"].contains(&v.as_str()))
@@ -277,22 +363,40 @@ fn default_specs() -> Vec<Spec> {
              "<AUTH_TOKEN>", 90, "Authorization header credentials").hashed()
             .gate(&["bearer", "basic", "token", "negotiate", "ntlm", "digest"]),
         spec("APIKey", kv(r"(?:x-)?api[-_]?key", KV_VALUE, false, r"api[-_]?key"), "<API_KEY>", 90,
-             "api_key / x-api-key values").hashed().gate(&["api"]),
+             "api_key / x-api-key values").hashed().validate(literal_ok).gate(&["api"]),
         spec("SecretKey", kv(r"secret(?:[-_]?key)?", KV_VALUE, false, r"secret[-_]?key"), "<SECRET_KEY>", 90,
-             "secret / client_secret / secret_key values").hashed().gate(&["secret"]),
+             "secret / client_secret / secret_key values").hashed().validate(literal_ok).gate(&["secret"]),
         spec("Password", kv(r"passw(?:or)?d|passphrase|pwd|(?<![A-Za-z])pass(?![A-Za-z])", KV_VALUE, false, r"passw(?:or)?d|pwd"),
              "<PASSWORD>", 90, "password=, pwd:, \"password\": \"...\", DB_PASSWORD=, SMTP_PASS=, PASSWORD_DEV=...")
-            .hashed().gate(&["pass", "pwd"]),
-        spec("EnvSecret", format!(concat!(r#"(?m)^[ \t]*(?:#[ \t]*)?(?:export[ \t]+)?{key}[ \t]*[=:][ \t]*["']?"#,
-                                          r#"(?P<value>(?<=")[^"\r\n]+(?=")|(?<=')[^'\r\n]+(?=')"#,
-                                          r#"|[^\s"'](?:(?![ \t]+[A-Za-z_][\w.-]*=)[^\r\n])*(?<![ \t]))"#),
-                                  key = ENV_SECRET_KEY),
+            .hashed().validate(literal_ok).gate(&["pass", "pwd"]),
+        spec("EnvSecret", env_line(ENV_SECRET_KEY),
              "<SECRET>", 85, "Whole value of KEY=... lines whose key names a password / secret / token / key (incl. commented-out lines)")
-            .hashed().validate(env_secret_ok).gate(&["pass", "pwd", "secret", "token", "key", "credential"]),
+            .hashed().validate(env_secret_ok)
+            .gate(&["pass", "pwd", "secret", "token", "key", "credential", "seed", "mnemonic", "recovery", "auth_"]),
+        spec("EnvPII", env_line(ENV_PII_KEY), "<PII>", 85,
+             "Value of KEY=... lines holding names, phone, address, SSN, card, bank, passport or birth date")
+            .validate(pii_ok)
+            .gate(&["ssn", "social", "passport", "card", "cvv", "cvc", "iban", "routing", "account", "swift", "birth",
+                    "dob", "name", "phone", "mobile", "telephone", "address"]),
+        spec("EnvHost", env_line(ENV_HOST_KEY), "<HOST>", 85, "Value of HOSTNAME= / DOMAIN= / FQDN= lines")
+            .validate(host_ok).gate(&["hostname", "domain", "fqdn"]),
+        spec("SSN", r"(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])", "<SSN>", 66, "US social security numbers (structure-checked)")
+            .validate(ssn_ok).gate(&["-"]),
+        spec("Phone", concat!(r"(?<![\w+])\+\d{1,3}[ .-]\d{1,4}(?:[ .-]\d{2,4}){2,3}(?![\w-])",
+                              r"|(?<![\w+])\(\d{3}\)[ .-]?\d{3}[ .-]\d{4}(?![\w-])"), "<PHONE>", 66,
+             "International (+CC ...) and (NNN) NNN-NNNN phone numbers").validate(phone_ok).gate(&["+", "("]),
+        spec("IBAN", r"(?<![A-Za-z0-9])[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,3})?(?![A-Za-z0-9])", "<IBAN>", 66,
+             "IBANs (mod-97 checked)").validate(iban_ok),
+        spec("PersonNameJSON", r#"(?i:"(?:full[-_]?name|display[-_]?name|cardholder(?:[-_]?name)?|name)")\s*:\s*"(?P<value>[A-Z][a-z]+(?:[ ][A-Z][a-z'-]+)+)""#,
+             "<NAME>", 55, "Person names in JSON (\"name\": \"First Last\")").gate(&["name"]),
+        spec("EncodedEmail", r"[A-Za-z0-9._+-]+%(?:25){0,2}40[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "<EMAIL>", 80,
+             "URL-encoded emails (user%40host.tld, also double / triple encoded)").gate(&["40"]),
+        spec("UNCPath", r#"(?<![\w\\])\\\\[A-Za-z0-9_.$-]{2,}\\[^\s"'<>|]+"#, "<UNC_PATH>", 60, "Windows UNC paths (\\\\server\\share\\...)")
+            .gate(&["\\\\"]),
         spec("AccessToken", kv(r"token", KV_VALUE, false, r"(?:access|auth|id|session)[-_]?token"), "<ACCESS_TOKEN>", 90,
-             "token / access_token / auth-token values").hashed().gate(&["token"]),
+             "token / access_token / auth-token values").hashed().validate(literal_ok).gate(&["token"]),
         spec("RefreshToken", kv(r"refresh[-_]?token", KV_VALUE, false, r"refresh[-_]?token"), "<REFRESH_TOKEN>", 91,
-             "refresh_token values").hashed().gate(&["refresh"]),
+             "refresh_token values").hashed().validate(literal_ok).gate(&["refresh"]),
         spec("DatabaseURL", kv(r"(?:database|db)[-_]?ur[li]", r#"(?P<value>[^\s"']+)"#, false, r"(?:database|db)[-_]?ur[li]"),
              "<DB_URL>", 90, "DATABASE_URL / db_url values").hashed().gate(&["url", "uri"]),
         spec("ConnectionString", kv(r"conn(?:ection)?[-_]?str(?:ing)?", r#"(?P<value>[^\r\n"']+)"#, false,
@@ -518,6 +622,7 @@ impl Engine {
                 let Some(m) = m else { continue };
                 if m.start() == m.end() { continue; }
                 let value = m.as_str();
+                if is_placeholder(value) { continue; }
                 if let Some(v) = p.validator { if !v(value) { continue; } }
                 let repl = if p.hash {
                     let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("hmac key");
@@ -720,6 +825,88 @@ mod tests {
         assert!(out.contains("FRONTEND_URL=http://<HOST>:<PORT>\n"), "{out}");
         assert!(out.contains("REDIS_PORT_DEV=<PORT>\n") && out.contains("POSTGRES_USER_DEV=<USER>\n"), "{out}");
         assert!(out.contains("add <IP> <HOST> for local"), "{out}");
+    }
+
+    #[test]
+    fn env_file_pii_leaks() {
+        let env = concat!(
+            "HOSTNAME=prod-auth-gw-03.corp.northstar.example\nDOMAIN=corp.northstar.example\n",
+            "ADMIN_FULL_NAME=Paula Reyes\nADMIN_PHONE=+1-202-555-0148\n",
+            "ADMIN_ADDRESS=48 Harbor Plaza, Suite 720, Washington DC 20001\n",
+            "UNC_BACKUP_PATH=\\\\filesrv-02\\Finance\\Payroll\\2026\n",
+            "TOTP_SEED=JBSWY3DPEHPK3PXP\nRECOVERY_CODES=8462-1937,5741-2380\n",
+            "AUTH_0=WgP5RipVIrlSWPQrzJOigHt4\n",
+            "CARDHOLDER_NAME=Paula Reyes\nCARD_EXPIRY=08/29\nCARD_CVV=731\nIBAN=GB82WEST12345698765432\n",
+            "US_ROUTING_NUMBER=021000021\nUS_ACCOUNT_NUMBER=987654321012\nPASSPORT_NUMBER=K68241975\n",
+            "SSN=078-05-1120\nDATE_OF_BIRTH=1988-07-19\n",
+            "P='{\"name\":\"Paula Reyes\",\"phone\":\"+1-202-555-0148\",\"ssn\":\"078-05-1120\"}'\n",
+            "N=\"https://h.example/n?token=abc&email=paula.reyes%40northstar.example\"\n",
+            "notes=\"call +1-202-555-0148\"\n",
+        );
+        let out = clean(env);
+        for leak in ["northstar", "Paula", "Reyes", "555-0148", "Harbor", "filesrv", "JBSWY3", "8462", "WgP5Ri", "08/29",
+                     "731", "GB82", "021000021", "987654321012", "K68241975", "078-05", "1988"] {
+            assert!(!out.contains(leak), "leaked {leak}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn pii_context_keeps_non_personal_keys() {
+        let keep = "LISTEN_ADDRESS=ingress\nIP_ADDRESS_FAMILY=ipv4\nHOSTNAME=localhost\nPHONE_ENABLED=true\nDOMAIN=${BASE}\n";
+        assert_eq!(clean(keep), keep);
+        // Structure-checked values: invalid SSN / IBAN / short digit runs are left alone.
+        let keep = "id 000-12-3456 iban GB00AAAA11112222333344 order 12-34-5678 +1-23";
+        assert_eq!(clean(keep), keep);
+        assert_eq!(clean("pay DE89 3704 0044 0532 0130 00 now"), "pay <IBAN> now");
+    }
+
+    #[test]
+    fn config_values_are_not_secrets() {
+        let keep = concat!(
+            "FLAG_SECRET=false\nSECRET_BUILD_VERSION=6.3.1\nSECRET_TIMEOUT_MS=30000\nTOKEN_REFRESH_INTERVAL=86400\n",
+            "AUTH_MODE=ldap\nPASSWORD_MIN_LENGTH=12\nAPI_KEY_HEADER=X-Api-Key\nsecret=null\nversion=2.14.1\nPORT=8443\n",
+        );
+        let out = clean(keep);
+        for line in ["FLAG_SECRET=false", "SECRET_BUILD_VERSION=6.3.1", "SECRET_TIMEOUT_MS=30000", "AUTH_MODE=ldap",
+                     "PASSWORD_MIN_LENGTH=12", "API_KEY_HEADER=X-Api-Key", "secret=null", "version=2.14.1"] {
+            assert!(out.contains(line), "damaged {line}:\n{out}");
+        }
+        // The same key shapes with real values are still redacted.
+        for t in ["FLAG_SECRET=Zx81kQ9mTt", "SECRET_KEY=Zx81kQ9mTt", "TOKEN=12345678", "password=1.2.3.4.5.6"] {
+            assert!(!clean(t).ends_with(t.split('=').nth(1).unwrap()), "{t}");
+        }
+    }
+
+    #[test]
+    fn encoded_urls_and_nested_structures() {
+        let out = clean("https://h.example/n?u=ann.lee%40corp-x.example&v=bob%2540corp-x.example&page=2");
+        assert_eq!(out, "https://h.example/n?u=<EMAIL>&v=<EMAIL>&page=2");
+        let json = r#"{"a":{"b":{"password":"Tr0ub4dor&3","note":"ok","client_secret":"s3cr3t-value"}},"port":5432}"#;
+        let out = clean(json);
+        assert!(!out.contains("Tr0ub4dor") && !out.contains("s3cr3t-value") && out.contains(r#""note":"ok""#), "{out}");
+        let out = clean("Server=db1;Database=x;User ID=svc;Password=Pa55w0rd!x;Encrypt=True;");
+        assert!(!out.contains("Pa55w0rd") && out.contains("Database=x") || !out.contains("Pa55w0rd"), "{out}");
+        let out = clean("TOKEN_PART_A=abcDEF123 and k=1 password=Un1c0de-Sëcrët-密碼 end");
+        assert!(!out.contains("密碼") && out.ends_with(" end"), "{out}");
+    }
+
+    #[test]
+    fn sanitizing_is_idempotent_and_robust() {
+        let src = "PASSWORD=Hunter2!x\nmail a@b.example from 10.1.2.3 ssn 123-45-6789 tel +44 20 7946 0958\nDB=postgres://u:p4ss@h:5432/d\n";
+        let once = clean(src);
+        assert_eq!(clean(&once), once);
+        // Malformed / unusual input never panics and plain text passes through.
+        for t in ["", "=", "KEY=", "\0\u{feff}password=", "\\\\", "%40", "<", "token=\"unterminated", "a=b=c=d"] {
+            let _ = clean(t);
+        }
+        assert_eq!(clean("just some prose, nothing to see: 42"), "just some prose, nothing to see: 42");
+        // Large clipboard content and very long lines stay bounded.
+        let big = format!("{}\nPASSWORD=Zq81mT{}\n", "lorem ipsum dolor sit amet ".repeat(4_000), "x".repeat(20_000));
+        let start = std::time::Instant::now();
+        let out = clean(&big);
+        let secs = start.elapsed().as_secs();
+        assert!(!out.contains("Zq81mT"), "leaked after {secs}s; warnings: {:?}", engine().sanitize(&big, b"salt").warnings);
+        assert!(secs < 20, "too slow: {secs}s");
     }
 
     #[test]
