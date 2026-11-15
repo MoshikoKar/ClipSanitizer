@@ -6,10 +6,14 @@
 # Secrets / env
 .env
 .env.*
+*.env
 *.pem
 *.p12
 credentials.json
 **/secrets/**
+
+# Local sample inputs (not release artifacts)
+/examples/
 
 # OS junk
 .DS_Store
