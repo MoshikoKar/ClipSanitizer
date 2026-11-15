@@ -4,6 +4,20 @@ All notable changes to Clip Sanitizer are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-15
+
+### Added
+
+- Broader env/PII sanitizing: host/domain lines, names, phone, address, SSN, IBAN, card fields, UNC paths, URL-encoded emails
+
+### Fixed
+
+- Updater GitHub HTTP handling so private/unreachable Releases are explained clearly instead of a misleading "release not found"
+
+### Changed
+
+- README notes that the repository must be public for unauthenticated update checks
+
 ## [0.2.0] - 2026-11-15
 
 ### Added
